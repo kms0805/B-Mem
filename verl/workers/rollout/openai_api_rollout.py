@@ -1,0 +1,471 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+OpenAI-compatible HTTP chat completions for closed-model evaluation (scheme A).
+
+When ``openai_api.use_structured_messages`` is true and ``raw_prompt`` is present in
+``non_tensor_batch`` (enable ``data.return_raw_chat=True`` upstream), requests use plain
+OpenAI-style ``messages`` with optional ``system_prompt`` plus user/assistant turns.
+
+Otherwise falls back to decoding ``input_ids`` (local chat template string) as a single
+user message for backward compatibility.
+"""
+
+from __future__ import annotations
+import os
+import re
+
+import json
+import logging
+import threading
+import time
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Sequence
+
+import numpy as np
+import torch
+from omegaconf import DictConfig, OmegaConf
+from tensordict import TensorDict
+
+from verl import DataProto
+from verl.utils.torch_functional import get_response_mask
+from verl.workers.rollout.base import BaseRollout
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_OPENAI_API_SYSTEM_PROMPT = "You are a helpful assistant."
+
+_POLICY_REJECTION_MARKERS = (
+    "invalid_prompt",
+    "content_filter",
+    "usage policy",
+    "content management policy",
+    "violating our usage policy",
+)
+
+
+def resolve_openai_api_system_prompt(raw: Any) -> str:
+    """Configured ``openai_api.system_prompt``, else a neutral default (not Qwen identity)."""
+    if raw is not None and str(raw).strip():
+        return str(raw).strip()
+    return DEFAULT_OPENAI_API_SYSTEM_PROMPT
+
+
+def is_policy_rejected_api_error(err: BaseException) -> bool:
+    """True when the gateway rejected the prompt for content / usage policy (typically HTTP 400)."""
+    msg = str(err).lower()
+    return any(marker in msg for marker in _POLICY_REJECTION_MARKERS)
+
+
+def _normalize_chat_url(base_url: str) -> str:
+    base = (base_url or "").rstrip("/")
+    if not base.endswith("/v1"):
+        base = base + "/v1"
+    return base + "/chat/completions"
+
+
+def _http_chat_completion(
+    url: str,
+    headers: Dict[str, str],
+    payload: dict,
+    timeout: float,
+) -> str:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8", errors="replace")[:800]
+        raise RuntimeError(f"Chat API HTTP {e.code}: {err}") from e
+    choices = body.get("choices") or []
+    if not choices:
+        return ""
+    msg = choices[0].get("message") or {}
+    content = msg.get("content")
+    if content is None:
+        return ""
+    return content.strip()
+
+
+def _flatten_message_content(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for seg in content:
+            if isinstance(seg, dict):
+                if seg.get("type") == "text":
+                    parts.append(str(seg.get("text", "")))
+                elif "text" in seg:
+                    parts.append(str(seg.get("text", "")))
+            elif isinstance(seg, str):
+                parts.append(seg)
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+_INLINE_CONT_NOTE = ("Now continue this turn: do not write a new belief; "
+                     "reason inside <think> </think>, then give exactly one admissible action inside <action> </action>.")   # same text as belief_alfworld.CHAT_CONT_TAIL
+
+
+_INLINE_CONT_NOTE_NOBELIEF = "Now continue this turn: reason inside <think> </think>, then give exactly one admissible action inside <action> </action>."   # no-belief ablation
+
+
+def _normalize_chat_entry(entry: Any) -> Optional[Dict[str, str]]:
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        role = str(entry.get("role", "user")).strip().lower()
+        if role not in ("system", "user", "assistant"):
+            role = "user"
+        content = _flatten_message_content(entry.get("content"))
+        return {"role": role, "content": content}
+    return None
+
+
+def _raw_chat_to_list(raw_chat: Any) -> List[Any]:
+    if raw_chat is None:
+        return []
+    if isinstance(raw_chat, np.ndarray):
+        return raw_chat.tolist()
+    if isinstance(raw_chat, (list, tuple)):
+        return list(raw_chat)
+    return [raw_chat]
+
+
+def build_openai_messages(
+    *,
+    raw_chat: Any = None,
+    fallback_user_text: str = "",
+    system_prompt: str = "",
+) -> List[Dict[str, str]]:
+    """Build OpenAI Chat Completions ``messages`` from structured chat or plain user text."""
+    messages: List[Dict[str, str]] = []
+    entries = [_normalize_chat_entry(e) for e in _raw_chat_to_list(raw_chat)]
+    entries = [e for e in entries if e is not None]
+
+    has_system = any(e["role"] == "system" for e in entries)
+    configured_system = (system_prompt or "").strip()
+    if configured_system and not has_system:
+        messages.append({"role": "system", "content": configured_system})
+
+    if entries:
+        for entry in entries:
+            messages.append(entry)
+        return messages
+
+    if configured_system and not messages:
+        messages.append({"role": "system", "content": configured_system})
+    user_text = (fallback_user_text or "").strip()
+    if user_text:
+        messages.append({"role": "user", "content": user_text})
+    elif not messages:
+        messages.append({"role": "user", "content": ""})
+    return messages
+
+
+def _preview_user_message(messages: Sequence[Dict[str, str]], max_chars: int = 160) -> str:
+    for msg in messages:
+        if msg.get("role") == "user":
+            text = str(msg.get("content") or "")
+            if len(text) <= max_chars:
+                return text
+            return text[: max_chars - 1] + "…"
+    return ""
+
+
+class OpenAIApiRollout(BaseRollout):
+    """Rollout via OpenAI-compatible ``/v1/chat/completions`` (no local generation)."""
+
+    def __init__(self, config: DictConfig, tokenizer, **kwargs):
+        super().__init__()
+        self.config = config
+        self.tokenizer = tokenizer
+        self.oa = config.get("openai_api") or {}
+        self._url = _normalize_chat_url(str(self.oa.get("base_url", "https://api.openai.com/v1")))
+        self._api_key = str(self.oa.get("api_key", "") or "")
+        self._model = str(self.oa.get("model", "gpt-4o-mini"))
+        _k = str(self.oa.get("api_key", "")).strip()
+        if _k == "ENV" or _k.startswith("ENV:"):   # keyenv patch: keep the key out of hydra config dumps/logs; "ENV:NAME" reads $NAME (e.g. OPENROUTER_API_KEY)
+            import os as _os
+            self._api_key = _os.environ.get(_k[4:] if _k.startswith("ENV:") else "OPENAI_API_KEY", "")
+        self._max_concurrent = int(self.oa.get("max_concurrent", 8))
+        self._timeout = float(self.oa.get("timeout_sec", 120.0))
+        self._max_retries = int(self.oa.get("max_retries", 2))
+        self._retry_backoff = float(self.oa.get("retry_backoff_sec", 1.0))
+        self._use_structured_messages = bool(self.oa.get("use_structured_messages", True))
+        self._skip_policy_rejected = bool(self.oa.get("skip_policy_rejected_prompts", True))
+        self._system_prompt = resolve_openai_api_system_prompt(self.oa.get("system_prompt"))
+        if os.environ.get("BMEM_SYSTEM_PROMPT_FILE"):   # teacher system prompt from a file (per environment)
+            self._system_prompt = open(os.environ["BMEM_SYSTEM_PROMPT_FILE"]).read().strip()
+        print(f"[teacher system prompt] file={os.environ.get('BMEM_SYSTEM_PROMPT_FILE')} head={self._system_prompt[:60]!r} has_belief={'<belief>' in self._system_prompt}", flush=True)
+        extra = self.oa.get("extra_headers")
+        self._extra_headers: Dict[str, str] = dict(OmegaConf.to_container(extra, resolve=True)) if extra else {}
+        body = self.oa.get("extra_body")
+        self._extra_body: Dict[str, Any] = dict(OmegaConf.to_container(body, resolve=True)) if body else {}
+        raw_disable_thinking = self.oa.get("disable_thinking", None)
+        if raw_disable_thinking is not None:
+            try:
+                if bool(raw_disable_thinking):
+                    self._extra_body.setdefault("enable_thinking", False)
+            except Exception:
+                pass
+        else:
+            # Qwen3 / Qwen3.5 compatible gateways often default to reasoning mode.
+            # Unless the user explicitly overrides via extra_body, disable it here.
+            model_norm = self._model.lower().replace("-", "").replace("_", "").replace(".", "")
+            if "qwen3" in model_norm:
+                self._extra_body.setdefault("enable_thinking", False)
+
+        self._stats_lock = threading.Lock()
+        self._api_call_total = 0
+        self._api_policy_rejected_total = 0
+
+    def _record_batch_stats(self, batch_total: int, batch_rejected: int) -> None:
+        with self._stats_lock:
+            self._api_call_total += batch_total
+            self._api_policy_rejected_total += batch_rejected
+            cumulative_rejected = self._api_policy_rejected_total
+            cumulative_total = self._api_call_total
+
+        summary = (
+            f"openai_api rollout: batch policy_rejected={batch_rejected}/{batch_total}, "
+            f"cumulative policy_rejected={cumulative_rejected}/{cumulative_total}"
+        )
+        logger.info(summary)
+        print(summary, flush=True)
+
+    def _decode_prompt_text(self, idx_row: torch.Tensor, attention_row: torch.Tensor) -> str:
+        row_mask = attention_row.bool()
+        ids = idx_row[row_mask].detach().cpu()
+        return self.tokenizer.decode(ids, skip_special_tokens=False)
+
+    def _build_batch_messages(self, prompts: DataProto, batch_size: int) -> List[List[Dict[str, str]]]:
+        raw_prompts = prompts.non_tensor_batch.get("raw_prompt") if prompts.non_tensor_batch else None
+        use_structured = self._use_structured_messages and raw_prompts is not None
+
+        batch_messages: List[List[Dict[str, str]]] = []
+        if (prompts.meta_info or {}).get("is_mem_adaptor"):   # adaptor fix: rebuild the rewriter's own system/user turns from ChatML, no policy system prompt
+            for i in range(batch_size):
+                text = self._decode_prompt_text(prompts.batch["input_ids"][i], prompts.batch["attention_mask"][i])
+                msgs = [{"role": m.group(1), "content": m.group(2).strip()} for m in re.finditer(r"<\|im_start\|>(system|user|assistant)\n(.*?)<\|im_end\|>", text, re.S)]
+                batch_messages.append(msgs or [{"role": "user", "content": text}])
+            return batch_messages
+        for i in range(batch_size):
+            fallback_text = self._decode_prompt_text(
+                prompts.batch["input_ids"][i],
+                prompts.batch["attention_mask"][i],
+            )
+            if use_structured:
+                raw_chat = raw_prompts[i]
+                batch_messages.append(
+                    build_openai_messages(
+                        raw_chat=raw_chat,
+                        fallback_user_text=fallback_text,
+                        system_prompt=self._system_prompt,
+                    )
+                )
+            else:
+                batch_messages.append([{"role": "user", "content": fallback_text}])
+        if os.environ.get("BMEM_FORCE_FIRST_QUERY", "0") == "1":   # prompted models: every episode opens with a memory query (system note, never in SFT rows)
+            for msgs in batch_messages:
+                last = msgs[-1]["content"] if msgs else ""
+                if ("-= Welcome to TextWorld" in last or "already taken 0 step(s)" in last) and "<memory>" not in last:   # ALFWorld step 0 uses the no-history template
+                    note = ("For this first decision of the episode, output a memory query (no think, no action)." if os.environ.get("BMEM_PROMPT_VARIANT") == "nobelief"
+                            else "For this first decision of the episode, write your belief and then a memory query (no think, no action).")
+                    if msgs[0].get("role") == "system":
+                        msgs[0] = {"role": "system", "content": msgs[0]["content"] + "\n\n" + note}
+                    else:
+                        msgs.insert(0, {"role": "system", "content": note})
+        return batch_messages
+
+    @torch.no_grad()
+    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        idx = prompts.batch["input_ids"]
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
+        eos_token_id = prompts.meta_info["eos_token_id"]
+        pad_token_id = prompts.meta_info["pad_token_id"]
+
+        batch_size = idx.size(0)
+        device = idx.device
+
+        if not self._api_key:
+            raise ValueError(
+                "openai_api.api_key is empty. Set actor_rollout_ref.rollout.openai_api.api_key "
+                "or environment variable (e.g. OPENAI_API_KEY) via Hydra."
+            )
+
+        batch_messages = self._build_batch_messages(prompts, batch_size)
+        _am = prompts.non_tensor_batch.get("active_masks") if prompts.non_tensor_batch else None   # active-env patch
+        _skip_mask = [not bool(x) for x in _am] if _am is not None else None
+
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
+        if not do_sample:
+            temperature = 0.0
+            top_p = 1.0
+        elif is_validate:
+            temperature = float(self.config.val_kwargs.temperature)
+            top_p = float(self.config.val_kwargs.top_p)
+        else:
+            temperature = float(self.config.temperature)
+            top_p = float(self.config.top_p)
+
+        if prompts.meta_info.get("temperature") is not None:
+            temperature = float(prompts.meta_info["temperature"])
+        if prompts.meta_info.get("top_p") is not None:
+            top_p = float(prompts.meta_info["top_p"])
+
+        max_tokens = int(prompts.meta_info.get("response_length", self.config.response_length))
+        responses_text, policy_rejected_flags = self._complete_batch(
+            batch_messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        skip_mask=_skip_mask,
+        )
+
+        response = torch.full(
+            (batch_size, max_tokens),
+            pad_token_id,
+            dtype=idx.dtype,
+            device=device,
+        )
+
+        seq = torch.cat([idx, response], dim=-1)
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        response_position_ids = position_ids[:, -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        batch = TensorDict(
+            {
+                "prompts": idx,
+                "responses": response,
+                "input_ids": seq,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+            batch_size=batch_size,
+        )
+        non_tensor = {
+            "api_response_text": np.array(responses_text, dtype=object),
+            "api_policy_rejected": np.array(policy_rejected_flags, dtype=bool),
+        }
+        return DataProto(batch=batch, non_tensor_batch=non_tensor)
+
+    def _complete_batch(
+        self,
+        batch_messages: Sequence[Sequence[Dict[str, str]]],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        skip_mask: Optional[Sequence[bool]] = None,   # active-env patch
+    ) -> tuple[List[str], List[bool]]:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+            **self._extra_headers,
+        }
+        batch_rejected = 0
+        reject_lock = threading.Lock()
+
+        def one(i: int, messages: Sequence[Dict[str, str]]) -> tuple[str, bool]:
+            nonlocal batch_rejected
+            if skip_mask is not None and i < len(skip_mask) and skip_mask[i]:   # finished env: no API call
+                return "", False
+            _m = self._model.lower()
+            _reasoning_model = _m.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))   # gpt6 patch
+            messages = list(messages)
+            _prefill = os.environ.get("BMEM_API_PREFILL", "0") == "1"   # the endpoint is a local vLLM server that can continue an assistant message
+            if os.environ.get("BMEM_CHAT_CONT") == "inline" and messages and messages[-1].get("role") == "assistant" and not _prefill:
+                # tool-call continuation for an API teacher that cannot prefill: [assistant belief+query] + [user memory + continue note]
+                _c = messages[-1]["content"]; _k = _c.find("<memory>")
+                _prev, _mem = (_c[:_k].strip(), _c[_k:].strip()) if _k >= 0 else (_c.strip(), "")
+                _note = _INLINE_CONT_NOTE_NOBELIEF if os.environ.get("BMEM_PROMPT_VARIANT") == "nobelief" else _INLINE_CONT_NOTE
+                messages = messages[:-1] + [{"role": "assistant", "content": _prev},
+                                            {"role": "user", "content": _mem + "\n\n" + _note}]
+            payload: Dict[str, Any] = {
+                "model": self._model,
+                "messages": messages,
+            }
+            if _prefill:
+                if messages and messages[-1].get("role") == "assistant":   # inline continuation: keep generating inside the assistant message
+                    payload["continue_final_message"] = True
+                    payload["add_generation_prompt"] = False
+                payload["stop"] = ["</query>"]   # a query ends the policy's part of the turn; the memory is inserted by the harness
+                payload["include_stop_str_in_output"] = True
+            if _reasoning_model:
+                payload["max_completion_tokens"] = int(max_tokens) * 3   # gpt6 patch: reasoning tokens share the budget
+            else:
+                payload["max_tokens"] = max_tokens
+            if self._extra_body:
+                payload.update(self._extra_body)
+            if not _reasoning_model:
+                if temperature > 0:
+                    payload["temperature"] = temperature
+                    payload["top_p"] = top_p
+                else:
+                    payload["temperature"] = 0
+
+            delay = self._retry_backoff
+            last_err: Optional[BaseException] = None
+            for attempt in range(self._max_retries + 1):
+                try:
+                    return _http_chat_completion(self._url, headers, payload, self._timeout), False
+                except Exception as e:  # noqa: BLE001 — surface after retries
+                    last_err = e
+                    if self._skip_policy_rejected and is_policy_rejected_api_error(e):
+                        preview = _preview_user_message(messages)
+                        logger.warning(
+                            "openai_api policy rejection at batch index %s (skip, empty response): %s; user_preview=%r",
+                            i,
+                            e,
+                            preview,
+                        )
+                        with reject_lock:
+                            batch_rejected += 1
+                        return "", True
+                    logger.warning("openai_api rollout attempt %s failed: %s", attempt, e)
+                    if attempt < self._max_retries:
+                        time.sleep(delay)
+                        delay *= 2
+            assert last_err is not None
+            raise last_err
+
+        batch_total = len(batch_messages)
+        if self._max_concurrent <= 1:
+            results = [one(i, batch_messages[i]) for i in range(batch_total)]
+        else:
+            out: List[Optional[tuple[str, bool]]] = [None] * batch_total
+            with ThreadPoolExecutor(max_workers=min(self._max_concurrent, batch_total)) as ex:
+                futs = {ex.submit(one, i, batch_messages[i]): i for i in range(batch_total)}
+                for fut in as_completed(futs):
+                    i = futs[fut]
+                    out[i] = fut.result()
+            results = [x if x is not None else ("", False) for x in out]
+
+        responses_text = [text or "" for text, _ in results]
+        policy_rejected_flags = [bool(rejected) for _, rejected in results]
+        self._record_batch_stats(batch_total, batch_rejected)
+        return responses_text, policy_rejected_flags

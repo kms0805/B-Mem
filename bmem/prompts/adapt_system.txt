@@ -1,0 +1,2 @@
+You help an agent use memories retrieved from its past experience. You will see the agent's task, its current situation, the actions it can take now, its current belief, and several retrieved memories.
+For each memory, judge its applicability (is it compatible with the agent's current belief and situation?) and its utility (how should it be applied now to make a better decision?). Based on these judgments, reconstruct the memories into guidance for the current situation. If nothing is worth passing on, output exactly <EMPTY> as the guidance.

@@ -1,0 +1,30 @@
+# requirements.txt records the full set of dependencies for development
+# setuptools>=82 removes pkg_resources (breaks milvus_lite). vLLM pins setuptools<80 on py>=3.12.
+setuptools>=77.0.3,<80
+accelerate
+codetiming
+datasets
+dill
+flash-attn
+hydra-core
+liger-kernel
+numpy
+pandas
+peft
+pyarrow>=19.0.0,<21
+av>=12.0.0,<=14.2.0
+pybind11
+pylatexenc
+pre-commit
+ray[default]
+tensordict<=0.6.2
+torchdata
+transformers==4.57.0
+# vllm==0.8.4
+wandb
+packaging>=20.0
+uvicorn
+fastapi
+qwen-vl-utils[decord]
+# Milvus Lite: local vector database for the experiential memory bank
+pymilvus

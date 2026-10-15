@@ -1,0 +1,567 @@
+# Copyright 2025 MemAdaptor
+#
+# Train the Memory Adaptor policy with trajectory-level rewards (GRPO).
+# Requires ``use_actor_rollout_wg=false`` (dedicated adaptor WorkerGroup). Reasoning may be frozen
+# (``actor_rollout_ref.actor.trainable=false``) or trained in the same step (joint: leave Reasoning trainable).
+
+from __future__ import annotations
+
+import os
+import re
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
+
+import numpy as np
+import torch
+from omegaconf import DictConfig, OmegaConf, open_dict
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizer
+
+from collections import Counter
+
+from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor
+from verl.utils.dataset.rl_dataset import collate_fn
+
+# Default: penalize CJK, Japanese kana, Hangul, Cyrillic, Arabic (non–English-only completions for AlfWorld-style English tasks).
+_GRPO_ENGLISH_SHAPING_DEFAULT_RE = re.compile(
+    r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af\u0400-\u04ff\u0600-\u06ff]"
+)
+
+
+def _decode_adaptor_response_row(tokenizer: "PreTrainedTokenizer", resp: torch.Tensor, pad_id: int) -> str:
+    row = resp.long().detach().cpu()
+    mask = row != int(pad_id)
+    if not mask.any():
+        return ""
+    try:
+        return tokenizer.decode(row[mask], skip_special_tokens=True).strip()
+    except Exception:
+        return ""
+
+
+def _normalize_principle_text(text: str) -> str:
+    """Collapse whitespace for comparing adaptor output vs original principle."""
+    return " ".join((text or "").strip().split())
+
+
+def _is_placeholder_p_old(p_old: str, ma: DictConfig) -> bool:
+    t = _normalize_principle_text(p_old)
+    if not t:
+        return True
+    ph = _normalize_principle_text(str(ma.get("placeholder_old_principle", "(none)")))
+    return bool(ph) and t == ph
+
+
+def resolve_pending_mem_adaptor_step_rewards(
+    samples: List[Dict[str, Any]],
+    step_rewards: np.ndarray,
+) -> None:
+    """Attach env reward from the step immediately after an adaptor rewrite (same rollout round)."""
+    if not samples:
+        return
+    for s in samples:
+        if not s.get("pending_next_step_reward"):
+            continue
+        env_i = int(s.get("env_i", -1))
+        if env_i < 0 or env_i >= len(step_rewards):
+            s["pending_next_step_reward"] = False
+            s["next_step_env_reward"] = None
+            continue
+        s["next_step_env_reward"] = float(step_rewards[env_i])
+        s["pending_next_step_reward"] = False
+
+
+def finalize_pending_mem_adaptor_step_rewards(samples: List[Dict[str, Any]]) -> None:
+    """Clear unresolved pending rows at rollout end (no next env step after adaptor)."""
+    for s in samples:
+        if s.get("pending_next_step_reward"):
+            s["pending_next_step_reward"] = False
+            s["next_step_env_reward"] = None
+
+
+def _mem_adaptor_grpo_step_reward_shaping_delta(ma: DictConfig, sample: Dict[str, Any]) -> tuple[float, bool]:
+    """Bonus when the env reward on the step after adaptor rewrite increases vs the prior step."""
+    gs = OmegaConf.select(ma, "grpo_step_reward_shaping", default=None)
+    if gs is None or not bool(gs.get("enable", False)):
+        return 0.0, False
+    if bool(sample.get("mem_adaptor_reject", False)):
+        return 0.0, False
+    if sample.get("pending_next_step_reward", False):
+        return 0.0, False
+    next_r = sample.get("next_step_env_reward")
+    if next_r is None:
+        return 0.0, False
+    prior = float(sample.get("reward_at_adaptor_step", 0.0))
+    delta_r = float(next_r) - prior
+    if delta_r <= 0.0:
+        return 0.0, False
+    coef = float(gs.get("coef", 1.0))
+    return coef * delta_r, True
+
+
+def _mem_adaptor_grpo_identical_rewrite_penalty_delta(
+    ma: DictConfig,
+    sample: Dict[str, Any],
+    response_text: str,
+) -> tuple[float, bool]:
+    """Severe penalty when adaptor accepts but outputs text identical to the retrieved principle."""
+    gs = OmegaConf.select(ma, "grpo_identical_rewrite_penalty", default=None)
+    if gs is None or not bool(gs.get("enable", False)):
+        return 0.0, False
+    if bool(sample.get("mem_adaptor_reject", False)):
+        return 0.0, False
+    p_old = str(sample.get("p_old", ""))
+    if _is_placeholder_p_old(p_old, ma):
+        return 0.0, False
+    from agent_system.memory.mem_adaptor_rollout import _normalize_adaptor_output
+
+    empty_markers = list(ma.get("empty_output_markers", ["<EMPTY>", "<empty>"]))
+    norm_resp, is_reject = _normalize_adaptor_output(response_text, empty_markers)
+    if is_reject or not norm_resp:
+        return 0.0, False
+    if _normalize_principle_text(norm_resp) != _normalize_principle_text(p_old):
+        return 0.0, False
+    penalty = float(gs.get("penalty", 1.0))
+    coef = float(gs.get("coef", 1.0))
+    return -abs(coef * penalty), True
+
+
+def _mem_adaptor_grpo_episode_return_coef(ma: DictConfig) -> float:
+    gr = OmegaConf.select(ma, "grpo_reward", default=None)
+    if gr is not None and gr.get("episode_return_coef") is not None:
+        return float(gr.get("episode_return_coef"))
+    return 1.0
+
+
+def _mem_adaptor_grpo_english_shaping_delta(ma: DictConfig, response_text: str) -> tuple[float, bool]:
+    """Return (scalar delta added to outcome reward, whether penalty applied)."""
+    gs = OmegaConf.select(ma, "grpo_english_shaping", default=None)
+    if gs is None or not bool(gs.get("enable", False)):
+        return 0.0, False
+    text = (response_text or "").strip()
+    if not text:
+        return 0.0, False
+    pat_s = gs.get("pattern")
+    if pat_s is not None and str(pat_s).strip():
+        try:
+            pat = re.compile(str(pat_s), re.UNICODE)
+        except re.error:
+            pat = _GRPO_ENGLISH_SHAPING_DEFAULT_RE
+    else:
+        pat = _GRPO_ENGLISH_SHAPING_DEFAULT_RE
+    if pat.search(text):
+        penalty = float(gs.get("penalty", 0.5))
+        coef = float(gs.get("coef", 1.0))
+        return -abs(coef * penalty), True
+    return 0.0, False
+
+
+def scale_adaptor_grpo_advantages_by_traj_adaptor_steps(batch: DataProto, enabled: bool) -> None:
+    """
+    After ``compute_grpo_outcome_advantage``, optionally divide each row's advantages/returns by
+    the number of Adaptor training rows from the same ``traj_uid`` (credit split across calls).
+    """
+    if not enabled or batch.batch is None or "advantages" not in batch.batch:
+        return
+    tu = batch.non_tensor_batch.get("traj_uid")
+    if tu is None:
+        return
+    n_rows = len(tu)
+    keys = [str(tu[i]) for i in range(n_rows)]
+    counts = Counter(keys)
+    adv = batch.batch["advantages"]
+    for i in range(n_rows):
+        c = counts[keys[i]]
+        if c > 0:
+            adv[i] = adv[i] / float(c)
+    if "returns" in batch.batch:
+        ret = batch.batch["returns"]
+        for i in range(n_rows):
+            c = counts[keys[i]]
+            if c > 0:
+                ret[i] = ret[i] / float(c)
+
+
+def prune_mem_adaptor_training_samples_after_group_filter(
+    buf: List[Dict[str, Any]],
+    buf_start: int,
+    kept_traj_uid: np.ndarray,
+) -> None:
+    """Keep only adaptor rows from the current inner rollout whose ``traj_uid`` survived ``filter_group_data``."""
+    if buf_start < 0 or buf_start > len(buf):
+        return
+    new_chunk = buf[buf_start:]
+    del buf[buf_start:]
+    keep = {str(x) for x in np.asarray(kept_traj_uid, dtype=object).reshape(-1)}
+    buf.extend(s for s in new_chunk if str(s.get("traj_uid", "")) in keep)
+
+
+def format_mem_adaptor_training_sample_for_log(
+    sample: Dict[str, Any],
+    tokenizer: "PreTrainedTokenizer",
+    *,
+    max_prompt_chars: int = 4096,
+    max_response_chars: int = 4096,
+) -> str:
+    """Decode one adaptor GRPO training row (CPU prompt/response ids) for stdout / file logs."""
+
+    def _decode_ids(ids: Any) -> str:
+        if ids is None:
+            return ""
+        if hasattr(ids, "detach"):
+            ids = ids.detach().cpu()
+        try:
+            return tokenizer.decode(ids, skip_special_tokens=True).strip()
+        except Exception:
+            return "<decode_error>"
+
+    tu = str(sample.get("traj_uid", ""))
+    gi = str(sample.get("grpo_index", ""))
+    prompt = _decode_ids(sample.get("prompts"))
+    resp = _decode_ids(sample.get("responses"))
+    raw_pl, raw_rl = len(prompt), len(resp)
+    p_trunc = raw_pl > max_prompt_chars
+    r_trunc = raw_rl > max_response_chars
+    if p_trunc:
+        prompt = prompt[:max_prompt_chars] + "…"
+    if r_trunc:
+        resp = resp[:max_response_chars] + "…"
+    p_note = f"truncated, cap={max_prompt_chars} chars (full {raw_pl})" if p_trunc else f"full, {raw_pl} chars"
+    r_note = f"truncated, cap={max_response_chars} chars (full {raw_rl})" if r_trunc else f"full, {raw_rl} chars"
+    return (
+        f"traj_uid={tu} grpo_index={gi}\n"
+        "(prompt/response are tokenizer.decode(skip_special_tokens=True); "
+        "standalone lines like system/user/assistant come from the chat template text.)\n"
+        f"--- prompt ({p_note}) ---\n{prompt}\n"
+        f"--- response ({r_note}) ---\n{resp}\n"
+        "--- end mem_adaptor sample ---"
+    )
+
+
+def mem_adaptor_rollout_diag_metrics(
+    samples: List[Dict[str, Any]],
+    gen_batch_output: DataProto,
+) -> Dict[str, float]:
+    """Per-rollout diagnostics for adaptor training rows (same ``traj_uid`` / return as GRPO attach).
+
+    Uses ``gen_batch_output.non_tensor_batch`` ``traj_uid``, ``episode_rewards``, and
+    ``traj_episode_success`` (if present). Each adaptor sample must carry ``mem_adaptor_reject``
+    (single-call ``<EMPTY>``) when available.
+    """
+    empty = {
+        "mean_attached_return": 0.0,
+        "reject_rate": 0.0,
+        "nonempty_rate": 0.0,
+        "success_rate_when_applied": 0.0,
+        "success_rate_when_rejected": 0.0,
+        "step_reward_bonus_rate": 0.0,
+        "identical_rewrite_penalty_rate": 0.0,
+    }
+    if not samples:
+        return empty
+
+    tu = gen_batch_output.non_tensor_batch.get("traj_uid")
+    if tu is None or len(tu) == 0:
+        return empty
+
+    er = gen_batch_output.non_tensor_batch.get("episode_rewards")
+    ts = gen_batch_output.non_tensor_batch.get("traj_episode_success")
+    uid_map: Dict[str, tuple[float, float]] = {}
+    n_rows = len(tu)
+    for i in range(n_rows):
+        uid = str(tu[i])
+        if uid in uid_map:
+            continue
+        r = (
+            float(np.asarray(er[i], dtype=np.float64).reshape(-1)[0])
+            if er is not None
+            else 0.0
+        )
+        if ts is not None:
+            s = float(np.asarray(ts[i], dtype=np.float64).reshape(-1)[0])
+        else:
+            s = 1.0 if r > 0.0 else 0.0
+        uid_map[uid] = (r, s)
+
+    returns: List[float] = []
+    reject_flags: List[float] = []
+    succ_when_applied: List[float] = []
+    succ_when_rejected: List[float] = []
+    step_bonus_flags: List[float] = []
+    identical_pen_flags: List[float] = []
+    nonempty_n = 0
+
+    for s in samples:
+        tid = str(s.get("traj_uid", ""))
+        r, succ = uid_map.get(tid, (0.0, 0.0))
+        returns.append(r)
+        rej = bool(s.get("mem_adaptor_reject", False))
+        reject_flags.append(1.0 if rej else 0.0)
+        if rej:
+            succ_when_rejected.append(succ)
+        else:
+            succ_when_applied.append(succ)
+            nonempty_n += 1
+            prior = float(s.get("reward_at_adaptor_step", 0.0))
+            next_r = s.get("next_step_env_reward")
+            if next_r is not None and float(next_r) > prior:
+                step_bonus_flags.append(1.0)
+            else:
+                step_bonus_flags.append(0.0)
+            p_old = str(s.get("p_old", ""))
+            norm_resp = _normalize_principle_text(str(s.get("adaptor_norm_text", "")))
+            norm_old = _normalize_principle_text(p_old)
+            if norm_resp and norm_old and norm_old != "(none)" and norm_resp == norm_old:
+                identical_pen_flags.append(1.0)
+            else:
+                identical_pen_flags.append(0.0)
+
+    n = len(samples)
+    return {
+        "mean_attached_return": float(np.mean(returns)) if n else 0.0,
+        "reject_rate": float(np.mean(reject_flags)) if n else 0.0,
+        "nonempty_rate": float(1.0 - np.mean(reject_flags)) if n else 0.0,
+        "success_rate_when_applied": float(np.mean(succ_when_applied)) if succ_when_applied else 0.0,
+        "success_rate_when_rejected": float(np.mean(succ_when_rejected)) if succ_when_rejected else 0.0,
+        "step_reward_bonus_rate": float(np.mean(step_bonus_flags)) if nonempty_n else 0.0,
+        "identical_rewrite_penalty_rate": float(np.mean(identical_pen_flags)) if nonempty_n else 0.0,
+    }
+
+
+def train_memory_adaptor_enabled(config: DictConfig) -> bool:
+    """True when adaptor GRPO updates should run: enabled, dedicated WG, and ``train_memory_adaptor``."""
+    ma = OmegaConf.select(config, "mem_adaptor")
+    if ma is None or not bool(ma.get("enable", False)):
+        return False
+    if bool(ma.get("use_actor_rollout_wg", True)):
+        return False
+    return bool(ma.get("train_memory_adaptor", False))
+
+
+def mem_adaptor_kl_loss_enabled(config: DictConfig) -> bool:
+    """True when dedicated adaptor GRPO should use KL loss against a frozen ref worker."""
+    if not train_memory_adaptor_enabled(config):
+        return False
+    ma = OmegaConf.select(config, "mem_adaptor")
+    if ma is None:
+        return False
+    if ma.get("actor_use_kl_loss") is not None:
+        return bool(ma.get("actor_use_kl_loss"))
+    amref = OmegaConf.select(ma, "actor_rollout_ref")
+    if amref is None:
+        return False
+    return bool(OmegaConf.select(amref, "actor.use_kl_loss", default=False))
+
+
+def mem_adaptor_ref_actor_rollout_config(config: DictConfig) -> DictConfig:
+    """Config for colocated adaptor ``role=ref`` worker (frozen KL anchor).
+
+    ``mem_adaptor.ref_model.path`` overrides ``model.path`` when set (e.g. base instruct ckpt).
+    """
+    amref = config.mem_adaptor.actor_rollout_ref
+    ref_cfg = OmegaConf.create(OmegaConf.to_container(amref, resolve=True))
+    ref_path = OmegaConf.select(config.mem_adaptor, "ref_model.path", default=None)
+    if ref_path is not None and str(ref_path).strip():
+        with open_dict(ref_cfg):
+            with open_dict(ref_cfg.model):
+                ref_cfg.model.path = str(ref_path).strip()
+    return ref_cfg
+
+
+def _traj_uid_to_episode_reward(gen_batch: DataProto) -> Dict[str, float]:
+    """Map trajectory uid -> scalar episode return from a post-``gather_rollout_data`` batch."""
+    tu = gen_batch.non_tensor_batch.get("traj_uid")
+    if tu is None or len(tu) == 0:
+        return {}
+    n = len(tu)
+    er = gen_batch.non_tensor_batch.get("episode_rewards")
+    if er is None:
+        return {str(tu[i]): 0.0 for i in range(n)}
+    out: Dict[str, float] = {}
+    for i in range(n):
+        v = float(np.asarray(er[i], dtype=np.float64).reshape(-1)[0])
+        out[str(tu[i])] = v
+    return out
+
+
+def build_memory_adaptor_grpo_batch(
+    *,
+    config: DictConfig,
+    samples: List[Dict[str, Any]],
+    gen_batch_output: DataProto,
+    tokenizer: Optional["PreTrainedTokenizer"] = None,
+) -> Optional[DataProto]:
+    """
+    Collate adaptor rollout rows and attach outcome reward on the last non-pad response token.
+
+    Each ``samples`` entry: CPU tensors prompts, responses, input_ids, attention_mask, position_ids;
+    int pad_token_id; str traj_uid; ``grpo_index`` = Reasoning GRPO group uid (shared across the
+    ``env.rollout.n`` parallel envs) so ``compute_grpo_outcome_advantage`` dedupes one return per
+    ``(uid, traj_uid)`` and compares across trajectories in the same group.
+
+    Pass ``tokenizer`` = adaptor tokenizer (same as ``TrajectoryCollector.adaptor_tokenizer``) so
+    GRPO auxiliary shaping (e.g. ``grpo_english_shaping``) decodes responses correctly.
+    """
+    if not samples:
+        return None
+    finalize_pending_mem_adaptor_step_rewards(samples)
+    rmap = _traj_uid_to_episode_reward(gen_batch_output)
+    rl = int(config.mem_adaptor.actor_rollout_ref.rollout.response_length)
+    ma = config.mem_adaptor
+    episode_coef = _mem_adaptor_grpo_episode_return_coef(ma)
+    rows: List[dict] = []
+    n_shaping_pen = 0
+    n_shaping_tot = 0
+    n_step_bonus = 0
+    n_identical_pen = 0
+    for s in samples:
+        tid = str(s["traj_uid"])
+        r = float(rmap.get(tid, 0.0))
+        resp = s["responses"]
+        if resp.dim() != 1:
+            raise ValueError("mem_adaptor training expects 1D responses per row")
+        pad_id = int(s["pad_token_id"])
+        scores = torch.zeros(rl, dtype=torch.float32)
+        # Align to fixed rollout response length (padded in generate_sequences).
+        eff = min(int(resp.shape[0]), rl)
+        seg = resp[:eff]
+        nz = (seg != pad_id).nonzero(as_tuple=True)[0]
+        last = int(nz[-1].item()) if nz.numel() > 0 else max(eff - 1, 0)
+        last = min(last, rl - 1)
+        n_shaping_tot += 1
+        dec = _decode_adaptor_response_row(tokenizer, resp, pad_id) if tokenizer is not None else ""
+        delta_en, shaped_en = _mem_adaptor_grpo_english_shaping_delta(ma, dec)
+        if shaped_en:
+            n_shaping_pen += 1
+        delta_step, shaped_step = _mem_adaptor_grpo_step_reward_shaping_delta(ma, s)
+        if shaped_step:
+            n_step_bonus += 1
+        delta_id, shaped_id = _mem_adaptor_grpo_identical_rewrite_penalty_delta(ma, s, dec)
+        if shaped_id:
+            n_identical_pen += 1
+        scores[last] = episode_coef * r + delta_en + delta_step + delta_id
+        row = {
+            "prompts": s["prompts"],
+            "responses": s["responses"],
+            "input_ids": s["input_ids"],
+            "attention_mask": s["attention_mask"],
+            "position_ids": s["position_ids"],
+            "token_level_scores": scores,
+            "uid": s["grpo_index"],
+            "traj_uid": tid,
+        }
+        rows.append(row)
+
+    data = collate_fn(rows)
+    ref_rollout = config.mem_adaptor.actor_rollout_ref.rollout
+    meta: Dict[str, Any] = {"temperature": float(ref_rollout.temperature)}
+    if n_shaping_tot > 0:
+        meta["mem_adaptor_english_shaping_penalized"] = float(n_shaping_pen)
+        meta["mem_adaptor_english_shaping_total"] = float(n_shaping_tot)
+        meta["mem_adaptor_step_reward_bonus"] = float(n_step_bonus)
+        meta["mem_adaptor_identical_rewrite_penalized"] = float(n_identical_pen)
+        meta["mem_adaptor_shaping_total"] = float(n_shaping_tot)
+    return DataProto.from_single_dict(
+        data=data,
+        meta_info=meta,
+    )
+
+
+def prepare_adaptor_batch_for_rl(batch: DataProto, config: DictConfig) -> DataProto:
+    """Attach meta_info for ``compute_log_prob`` / ``update_actor`` on the adaptor worker."""
+    ref_rollout = config.mem_adaptor.actor_rollout_ref.rollout
+    batch.meta_info["micro_batch_size"] = ref_rollout.log_prob_micro_batch_size_per_gpu
+    batch.meta_info["max_token_len"] = ref_rollout.log_prob_max_token_len_per_gpu
+    batch.meta_info["use_dynamic_bsz"] = ref_rollout.log_prob_use_dynamic_bsz
+    batch.meta_info["temperature"] = float(ref_rollout.temperature)
+    batch.meta_info["multi_turn"] = False
+    return batch
+
+
+def pad_mem_adaptor_batch_for_dp(batch: DataProto, world_size: int) -> tuple[DataProto, int]:
+    """
+    Pad adaptor batches so ``len(batch)`` is divisible by DP ``world_size`` (avoids DataProto.chunk assert).
+    Refreshes ``meta_info["global_token_num"]`` when padding adds rows. Returns ``(padded_or_same, pad_size)``.
+    """
+    ws = int(world_size)
+    if ws <= 1 or len(batch) == 0 or len(batch) % ws == 0:
+        return batch, 0
+    padded, pad_size = pad_dataproto_to_divisor(batch, ws)
+    if pad_size and padded.batch is not None and "attention_mask" in padded.batch:
+        padded.meta_info["global_token_num"] = torch.sum(padded.batch["attention_mask"], dim=-1).tolist()
+    return padded, pad_size
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Shared-weights rewriter GRPO (belief patch, 2026-09-27). The rewriter runs on the policy weights
+# (use_actor_rollout_wg=true); with BMEM_TRAIN_SHARED_REWRITER=1 its calls from training rollouts join the policy
+# update, each call taking the GRPO advantage of the trajectory it served (the episode reward shared with the
+# rewriter output, same group normalization as the policy turns). One update_actor call, one loss.
+# ---------------------------------------------------------------------------------------------------------------
+def shared_rewriter_training_enabled(config: DictConfig) -> bool:
+    ma = OmegaConf.select(config, "mem_adaptor")
+    if ma is None or not bool(ma.get("enable", False)) or not bool(ma.get("use_actor_rollout_wg", True)):
+        return False
+    return os.environ.get("BMEM_TRAIN_SHARED_REWRITER", "0") == "1"
+
+
+def _pad_rewriter_row(s: Dict[str, Any], prompt_w: int, resp_w: int, pad_id: int) -> Dict[str, torch.Tensor]:
+    """Re-pad one rewriter call to the policy rows' widths: prompt left-padded to ``prompt_w``, response
+    right-padded to ``resp_w`` (rewriter calls use mem_adaptor.max_new_tokens, the policy rollout.response_length).
+    Padding tokens get attention 0; response positions keep counting so position_ids stay monotone."""
+    pr, rs = s["prompts"].long(), s["responses"].long()
+    am, pos = s["attention_mask"].long(), s["position_ids"].long()
+    lp, lr = pr.shape[0], rs.shape[0]
+    am_p, am_r = am[:lp], am[lp:]
+    pos_p, pos_r = pos[:lp], pos[lp:]
+    if lp < prompt_w:
+        k = prompt_w - lp
+        pr = torch.cat([torch.full((k,), pad_id, dtype=pr.dtype), pr]); am_p = torch.cat([torch.zeros(k, dtype=am.dtype), am_p])
+        pos_p = torch.cat([torch.zeros(k, dtype=pos.dtype), pos_p])
+    elif lp > prompt_w:
+        raise ValueError(f"rewriter prompt width {lp} > policy prompt width {prompt_w}")
+    if lr < resp_w:
+        k = resp_w - lr
+        rs = torch.cat([rs, torch.full((k,), pad_id, dtype=rs.dtype)]); am_r = torch.cat([am_r, torch.zeros(k, dtype=am.dtype)])
+        last = pos_r[-1] if lr > 0 else pos_p[-1]
+        pos_r = torch.cat([pos_r, last + torch.arange(1, k + 1, dtype=pos.dtype)])
+    elif lr > resp_w:
+        rs, am_r, pos_r = rs[:resp_w], am_r[:resp_w], pos_r[:resp_w]
+    return {"prompts": pr, "responses": rs, "input_ids": torch.cat([pr, rs]),
+            "attention_mask": torch.cat([am_p, am_r]), "position_ids": torch.cat([pos_p, pos_r])}
+
+
+def build_shared_rewriter_batch(samples: List[Dict[str, Any]], kept_traj_uid, prompt_w: int, resp_w: int) -> Optional[DataProto]:
+    """Collate buffered rewriter calls whose trajectory is in the policy batch, at the policy rows' tensor widths."""
+    keep = {str(x) for x in np.asarray(kept_traj_uid, dtype=object).reshape(-1)}
+    rows = []
+    for s in samples:
+        if str(s.get("traj_uid", "")) not in keep:
+            continue
+        r = _pad_rewriter_row(s, prompt_w, resp_w, int(s["pad_token_id"]))
+        r["traj_uid"] = str(s["traj_uid"]); r["mem_adaptor_reject"] = bool(s.get("mem_adaptor_reject", False))
+        rows.append(r)
+    if not rows:
+        return None
+    return DataProto.from_single_dict(data=collate_fn(rows))
+
+
+def attach_shared_rewriter_advantages(rw_batch: DataProto, policy_batch: DataProto) -> Dict[str, float]:
+    """advantages(rewriter row) = mean GRPO advantage of the policy rows of the same trajectory, on the rewriter
+    response tokens."""
+    pm = policy_batch.batch["response_mask"].float()
+    row_adv = (policy_batch.batch["advantages"] * pm).sum(-1) / pm.sum(-1).clamp(min=1.0)
+    ptu = policy_batch.non_tensor_batch["traj_uid"]
+    acc: Dict[str, List[float]] = {}
+    for i in range(len(ptu)):
+        acc.setdefault(str(ptu[i]), []).append(float(row_adv[i]))
+    traj_adv = {k: float(np.mean(v)) for k, v in acc.items()}
+    rtu = [str(x) for x in rw_batch.non_tensor_batch["traj_uid"]]
+    vals = torch.tensor([traj_adv.get(t, 0.0) for t in rtu], dtype=torch.float32)
+    rm = rw_batch.batch["response_mask"].float()
+    rw_batch.batch["advantages"] = vals.unsqueeze(-1).to(rm.device) * rm
+    rej = np.asarray(rw_batch.non_tensor_batch.get("mem_adaptor_reject", np.zeros(len(rtu))), dtype=float)
+    return {"shared_rewriter/rows": float(len(rtu)), "shared_rewriter/adv_mean": float(vals.mean()),
+            "shared_rewriter/adv_abs_mean": float(vals.abs().mean()), "shared_rewriter/reject_rate": float(rej.mean()) if len(rej) else 0.0,
+            "shared_rewriter/response_tokens_mean": float(rm.sum(-1).mean())}

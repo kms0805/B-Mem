@@ -1,0 +1,404 @@
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
+"""
+
+import os
+from importlib.metadata import PackageNotFoundError, version as importlib_pkg_version
+
+import hydra
+import ray
+from omegaconf import OmegaConf, open_dict
+from packaging import version as packaging_version
+
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.reward import load_reward_manager
+from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+
+
+def _installed_pkg_version_ge(pkg: str, minver: str) -> bool:
+    """Compare installed distribution version without importing the package (no CUDA/Triton)."""
+    try:
+        v = importlib_pkg_version(pkg)
+    except PackageNotFoundError:
+        return False
+    return packaging_version.parse(v) >= packaging_version.parse(minver)
+
+
+@hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
+def main(config):
+    run_ppo(config)
+
+
+def _mem_adaptor_dedicated_rollout_wg(config) -> bool:
+    ma = OmegaConf.select(config, "mem_adaptor")
+    if ma is None or not bool(ma.get("enable", False)): # if mem_adaptor is not enabled, return False
+        return False
+    return not bool(ma.get("use_actor_rollout_wg", True)) # if use_actor_rollout_wg is false, return True
+
+
+def _attach_mem_adaptor_actor_rollout_ref(config) -> None:
+    """Deep-copy actor_rollout_ref into mem_adaptor.actor_rollout_ref with adaptor model path."""
+    from omegaconf import open_dict
+
+    ma = config.mem_adaptor
+    path = OmegaConf.select(ma, "model.path")
+    if not path:
+        raise ValueError(
+            "mem_adaptor.model.path is required when mem_adaptor.enable=true and mem_adaptor.use_actor_rollout_wg=false."
+        )
+    train_ma = bool(ma.get("train_memory_adaptor", False))
+    existing_ar = OmegaConf.select(ma, "actor_rollout_ref", default=None)
+    ref = OmegaConf.create(OmegaConf.to_container(config.actor_rollout_ref, resolve=True))
+    with open_dict(ref):
+        with open_dict(ref.model):
+            ref.model.path = path
+            shm = OmegaConf.select(ma, "model.use_shm")
+            if shm is not None:
+                ref.model.use_shm = shm
+        with open_dict(ref.actor):
+            ref.actor.trainable = train_ma
+            if ma.get("actor_use_kl_loss") is not None:
+                ref.actor.use_kl_loss = bool(ma.get("actor_use_kl_loss"))
+            if ma.get("actor_kl_loss_coef") is not None:
+                ref.actor.kl_loss_coef = float(ma.get("actor_kl_loss_coef"))
+            if ma.get("actor_kl_loss_type") is not None:
+                ref.actor.kl_loss_type = str(ma.get("actor_kl_loss_type"))
+        if ma.get("ref_param_offload") is not None:
+            with open_dict(ref):
+                with open_dict(ref.ref):
+                    with open_dict(ref.ref.fsdp_config):
+                        ref.ref.fsdp_config.param_offload = bool(ma.get("ref_param_offload"))
+        # Dedicated adaptor WG must run hf/vllm for FSDP log-prob / vLLM generate; do not inherit openai_api.
+        with open_dict(ref.rollout):
+            if str(ref.rollout.name) == "openai_api":
+                local_rn = OmegaConf.select(ma, "local_rollout_name") or "vllm"
+                local_rn = str(local_rn).strip().lower()
+                if local_rn not in ("vllm", "hf"):
+                    raise ValueError(
+                        "mem_adaptor.local_rollout_name must be 'vllm' or 'hf' when the main policy uses "
+                        f"rollout.name=openai_api, got {local_rn!r}"
+                    )
+                ref.rollout.name = local_rn
+    if existing_ar is not None:
+        ref = OmegaConf.merge(ref, existing_ar)
+    with open_dict(config.mem_adaptor):
+        config.mem_adaptor.actor_rollout_ref = ref
+
+
+def run_ppo(config) -> None:
+    # Check if Ray is not initialized
+    if not ray.is_initialized():
+        # Initialize Ray with a local cluster configuration
+        # Set environment variables in the runtime environment to control tokenizer parallelism,
+        # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
+        # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
+        default_runtime_env = get_ppo_ray_runtime_env()
+        ray_init_kwargs = config.get("ray_init", {})
+        runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
+
+        runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
+        ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
+        ray_init_dict = OmegaConf.to_container(ray_init_kwargs, resolve=True)
+        # 连接已有集群（RAY_ADDRESS 或 ray_init.address）时，Ray 禁止再传 object_store_memory。
+        if os.environ.get("RAY_ADDRESS") or ray_init_dict.get("address"):
+            ray_init_dict.pop("object_store_memory", None)
+        print(f"ray init kwargs: {ray_init_dict}")
+        ray.init(**ray_init_dict)
+
+    runner = TaskRunner.remote()
+    ray.get(runner.run.remote(config))
+
+
+@ray.remote(num_cpus=1)  # please make sure main_task is not scheduled on head
+class TaskRunner:
+    def run(self, config):
+        # print initial config
+        from pprint import pprint
+
+        from omegaconf import OmegaConf
+
+        from verl.utils.fs import copy_to_local
+
+        pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
+        OmegaConf.resolve(config)
+        
+        # if mem_adaptor is enabled and use_actor_rollout_wg is false, attach the mem_adaptor actor rollout ref
+        if _mem_adaptor_dedicated_rollout_wg(config):
+            if config.actor_rollout_ref.actor.strategy not in ("fsdp", "fsdp2"):
+                raise NotImplementedError(
+                    "Dedicated mem_adaptor WorkerGroup (use_actor_rollout_wg=false) is only supported for FSDP/FSDP2."
+                )
+            _attach_mem_adaptor_actor_rollout_ref(config)
+
+        # start the memory server
+        memory_server_handle = None
+        if config.env.memory.enabled:
+            from agent_system.memory.local_service import start_local_memory_server
+
+            memory_server_handle = start_local_memory_server(
+                memory_config=config.env.memory,
+                task_name=config.env.env_name,
+            )
+            if memory_server_handle is not None:
+                OmegaConf.set_struct(config.env.memory, True)
+                with open_dict(config.env.memory):
+                    config.env.memory.backend = "http"
+                    config.env.memory.vdb_base_url = memory_server_handle.base_url
+
+        try:
+            # download the checkpoint from hdfs
+            local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
+            adaptor_tokenizer = None
+
+            if _mem_adaptor_dedicated_rollout_wg(config):
+                amref = config.mem_adaptor.actor_rollout_ref
+                adaptor_local = copy_to_local(amref.model.path, use_shm=amref.model.get("use_shm", False))
+                with open_dict(amref.model):
+                    amref.model.path = adaptor_local
+
+            from agent_system.environments import make_envs
+            envs, val_envs = make_envs(config)
+
+            # instantiate tokenizer
+            from verl.utils import hf_processor, hf_tokenizer
+
+            trust_remote_code = config.data.get("trust_remote_code", False)
+            tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+            processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)  # used for multimodal LLM, could be none
+
+            if _mem_adaptor_dedicated_rollout_wg(config):
+                adaptor_tokenizer = hf_tokenizer(config.mem_adaptor.actor_rollout_ref.model.path, trust_remote_code=trust_remote_code)
+
+            # vllm early verify：勿 import verl.utils.vllm_utils（会加载 vLLM+Triton；TaskRunner 未申请 GPU 时易报 0 active drivers）
+            if config.actor_rollout_ref.rollout.name in ["vllm"]:
+                if config.actor_rollout_ref.model.get("lora_rank", 0) > 0:
+                    if not _installed_pkg_version_ge("vllm", "0.7.3"):
+                        raise NotImplementedError("PPO LoRA is not supported before vllm 0.7.3")
+
+            # define worker classes
+            if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
+                assert config.critic.strategy in ["fsdp", "fsdp2"]
+                from verl.single_controller.ray import RayWorkerGroup
+                from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
+
+                actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
+                ray_worker_group_cls = RayWorkerGroup
+
+            elif config.actor_rollout_ref.actor.strategy == "megatron":
+                assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
+                from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
+                from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
+
+                actor_rollout_cls = ActorRolloutRefWorker
+                ray_worker_group_cls = NVMegatronRayWorkerGroup
+
+            else:
+                raise NotImplementedError
+
+            from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+
+            role_worker_mapping = {
+                Role.ActorRollout: ray.remote(actor_rollout_cls),
+                Role.Critic: ray.remote(CriticWorker),
+            }
+
+            global_pool_id = "global_pool"
+            resource_pool_spec = {
+                global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+            }
+            mapping = {
+                Role.ActorRollout: global_pool_id,
+                Role.Critic: global_pool_id,
+            }
+
+            if _mem_adaptor_dedicated_rollout_wg(config):
+                from agent_system.memory.mem_adaptor_training import train_memory_adaptor_enabled
+
+                if train_memory_adaptor_enabled(config):
+                    rn = str(config.mem_adaptor.actor_rollout_ref.rollout.name)
+                    if rn == "openai_api":
+                        raise ValueError(
+                            "mem_adaptor.train_memory_adaptor requires adaptor rollout.name to be hf or vllm "
+                            "(OpenAI API generation cannot train with FSDP log-prob)."
+                        )
+
+                nn = config.trainer.nnodes
+                gpus_spec = config.mem_adaptor.get("resource_pool_gpus_per_node")
+                if gpus_spec is None:
+                    mem_pool_spec = [1] * nn
+                elif isinstance(gpus_spec, int):
+                    mem_pool_spec = [gpus_spec] * nn
+                else:
+                    mem_pool_spec = list(gpus_spec)
+                if len(mem_pool_spec) != nn:
+                    raise ValueError(
+                        f"mem_adaptor.resource_pool_gpus_per_node must have length trainer.nnodes={nn}, got {len(mem_pool_spec)}"
+                    )
+                resource_pool_spec["mem_adaptor_pool"] = mem_pool_spec
+                role_worker_mapping[Role.MemAdaptorRollout] = ray.remote(actor_rollout_cls)
+                mapping[Role.MemAdaptorRollout] = "mem_adaptor_pool"
+
+            # we should adopt a multi-source reward function here
+            # - for rule-based rm, we directly call a reward score
+            # - for model-based rm, we call a model
+            # - for code related prompt, we send to a sandbox if there are test cases
+            # - finally, we combine all the rewards together
+            # - The reward type depends on the tag of the data
+            if config.reward_model.enable:
+                if config.reward_model.strategy in ["fsdp", "fsdp2"]:
+                    from verl.workers.fsdp_workers import RewardModelWorker
+                elif config.reward_model.strategy == "megatron":
+                    from verl.workers.megatron_workers import RewardModelWorker
+                else:
+                    raise NotImplementedError
+                role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
+                mapping[Role.RewardModel] = global_pool_id
+
+            # use reference model
+            if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+                role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
+                mapping[Role.RefPolicy] = global_pool_id
+
+            reward_manager_name = config.reward_model.get("reward_manager", "episode")
+            if reward_manager_name == 'episode':
+                from agent_system.reward_manager import EpisodeRewardManager
+                from agent_system.reward_manager.episode import (
+                    DEFAULT_NUM_EXAMINE_TRAIN,
+                    DEFAULT_NUM_EXAMINE_VAL,
+                )
+
+                reward_manager_cls = EpisodeRewardManager
+            else:
+                raise NotImplementedError
+
+            reward_fn = reward_manager_cls(
+                tokenizer=tokenizer,
+                num_examine=DEFAULT_NUM_EXAMINE_TRAIN,
+                normalize_by_length=False,
+                config=config,
+            )
+
+            # Note that we always use function-based RM for validation
+            val_reward_fn = reward_manager_cls(
+                tokenizer=tokenizer,
+                num_examine=DEFAULT_NUM_EXAMINE_VAL,
+                normalize_by_length=False,
+                config=config,
+            )
+
+            resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+
+            assert config.actor_rollout_ref.rollout.n == 1, "In verl, actor_rollout_ref.rollout.n>1 is for GRPO. In verl+env, we keep n=1, and achieve GRPO by env.rollout.n"
+
+            from agent_system.multi_turn_rollout import TrajectoryCollector
+            traj_collector = TrajectoryCollector(
+                config=config,
+                tokenizer=tokenizer,
+                processor=processor,
+                adaptor_tokenizer=adaptor_tokenizer,
+            )
+
+            from verl.utils.dataset.rl_dataset import collate_fn
+
+            train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
+            val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
+            train_sampler = create_rl_sampler(config.data, train_dataset)
+            trainer = RayPPOTrainer(
+                config=config,
+                tokenizer=tokenizer,
+                processor=processor,
+                role_worker_mapping=role_worker_mapping,
+                resource_pool_manager=resource_pool_manager,
+                ray_worker_group_cls=ray_worker_group_cls,
+                reward_fn=reward_fn,
+                val_reward_fn=val_reward_fn,
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                collate_fn=collate_fn,
+                train_sampler=train_sampler,
+                device_name=config.trainer.device,
+                traj_collector=traj_collector,
+                envs=envs,
+                val_envs=val_envs,
+            )
+            trainer.init_workers()
+            trainer.fit()
+        finally:
+            if memory_server_handle is not None:
+                memory_server_handle.close()
+
+
+def create_rl_dataset(data_paths, data_config, tokenizer, processor):
+    """Create a dataset.
+
+    Arguments:
+        data_config: The data config.
+        tokenizer (Tokenizer): The tokenizer.
+        processor (Processor): The processor.
+
+    Returns:
+        dataset (Dataset): The dataset.
+    """
+    from torch.utils.data import Dataset
+
+    from verl.utils.dataset.rl_dataset import RLHFDataset
+
+    if "custom_cls" in data_config and data_config.custom_cls.get("path", None) is not None:
+        from verl.utils.import_utils import load_extern_type
+
+        dataset_cls = load_extern_type(data_config.custom_cls.path, data_config.custom_cls.name)
+        if not issubclass(dataset_cls, Dataset):
+            raise TypeError(f"The custom dataset class '{data_config.custom_cls.name}' from '{data_config.custom_cls.path}' must inherit from torch.utils.data.Dataset")
+    else:
+        dataset_cls = RLHFDataset
+    print(f"Using dataset class: {dataset_cls.__name__}")
+
+    dataset = dataset_cls(
+        data_files=data_paths,
+        tokenizer=tokenizer,
+        processor=processor,
+        config=data_config,
+    )
+
+    return dataset
+
+
+def create_rl_sampler(data_config, dataset):
+    """Create a sampler for the dataset.
+
+    Arguments:
+        data_config: The data config.
+        dataset (Dataset): The dataset.
+
+    Returns:
+        sampler (Sampler): The sampler.
+    """
+    import torch
+    from torch.utils.data import RandomSampler, SequentialSampler
+
+    # use sampler for better ckpt resume
+    if data_config.shuffle:
+        train_dataloader_generator = torch.Generator()
+        train_dataloader_generator.manual_seed(data_config.get("seed", 42))
+        sampler = RandomSampler(data_source=dataset, generator=train_dataloader_generator)
+    else:
+        sampler = SequentialSampler(data_source=dataset)
+
+    return sampler
+
+
+if __name__ == "__main__":
+    main()

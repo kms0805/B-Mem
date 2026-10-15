@@ -1,0 +1,10 @@
+B-Mem
+Copyright 2026 The B-Mem authors
+
+This code builds on verl (https://github.com/volcengine/verl), verl-agent (https://github.com/langfengQ/verl-agent),
+and MemHarness (https://github.com/KnowledgeXLab/MemHarness), all licensed under the Apache License, Version 2.0.
+Files from these projects keep their original copyright headers; the B-Mem authors modified them to add the belief protocol,
+skill adaptation, the API rollout path, and the query penalty.
+
+agent_system/environments/env_package/alfworld/alfworld/ is a copy of ALFWorld (https://github.com/alfworld/alfworld),
+Copyright (c) 2020 Mohit Shridhar and others, licensed under the MIT License (see LICENSE in that directory).

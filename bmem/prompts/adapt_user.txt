@@ -1,0 +1,18 @@
+Task:
+{task}
+
+Current situation:
+{s_curr}
+
+Available actions:
+{admissible}
+
+Agent's current belief:
+{belief}
+
+Retrieved memories:
+{memories}
+
+Answer in exactly this format:
+<assessment>for each memory: its applicability and utility</assessment>
+<guidance>the reconstructed guidance, or exactly <EMPTY></guidance>
